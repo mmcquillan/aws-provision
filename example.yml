@@ -1,0 +1,11 @@
+env_name: MY_SYSTEM
+aws:
+-
+  type: ec2
+  name: MY_SERVER
+  domain_name: some.domain.name
+  image_id: ami-<id>
+  instance_type: t2.medium
+  security_group: <sec group name>
+  lb_name: <LB Name>
+  wait_status: true

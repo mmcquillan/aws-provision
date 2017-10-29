@@ -1,0 +1,333 @@
+#!/usr/bin/ruby
+#######################################################################
+# this is a scrpt to provision and deprovision AWS environments
+#######################################################################
+
+
+# required gems
+require 'yaml'
+require 'aws-sdk'
+require 'winrm'
+require 'nokogiri'
+require 'pp'
+
+
+# start feedback and timer
+start_time = Time.now
+puts ""
+puts ["="].cycle(60).to_a.join('')
+puts "AWS Provisioner..."
+puts ["="].cycle(60).to_a.join('')
+
+
+# validate input
+if ARGV.length != 2 || !( ARGV[1] == "up" || ARGV[1] == "down" ) then
+    abort("ERROR: use as ./aws [environment config] [up|down]")
+end
+env_file = ARGV[0]
+action = ARGV[1]
+trap("SIGINT") { exit! }
+
+
+# state action
+puts "---- starting " + action + " action for " + env_file
+
+
+# loading main configuration
+puts "---- loading main configuration"
+config_file = File.join(File.dirname(__FILE__), "config.yml")
+config = YAML.load(File.read(config_file))
+
+
+# determine environment config
+puts "---- loading environment configuration"
+if !env_file.end_with? '.yml' then
+    env_file = env_file + '.yml'
+end
+env_file = File.join(File.dirname(__FILE__), "env/" + env_file)
+env = YAML.load(File.read(env_file))
+
+
+# instantiate aws sdk objects
+puts "---- loading aws sdk objects"
+AWS.config(config)
+ec2 = AWS::EC2.new
+rrsets = AWS::Route53::HostedZone.new(config['hosted_zone_id']).rrsets
+elb = AWS::ELB.new
+
+
+# main loop
+env['aws'].each { |i|
+
+
+    # type: lb
+    if i['type'] == "lb" then
+
+        # setup
+        puts "---- running lb " + action + ": " + i['name']
+ecking if domain name exists"
+        domain_exists = false
+        rrsets.each { |r|
+            if r.name.include? i['domain_name'] then
+                domain_exists = true
+            end
+        }
+
+        # up action
+        if !domain_exists && action == "up" then
+           puts "     creating load balancer"
+           load_balancer = elb.load_balancers.create(i['name'],
+               :availability_zones => config['availability_zone'],
+               :listeners => [{
+                   :port => 80,
+                   :protocol => :http,
+                   :instance_port => 80,
+                   :instance_protocol => :http,
+               }]
+           )
+           puts "     creating load balancer dns entry"
+           rrsets.create(i['domain_name'], 'CNAME', :ttl => 60, :resource_records => [{:value => load_balancer.dns_name}])
+        elsif domain_exists && action == "up" then
+            abort("ERROR: domain name already exists")
+        end
+
+        # down action
+        if domain_exists && action == "down" then
+            puts "     removing load balancer"
+            elb.load_balancers[i['name']].delete
+            puts "     removing load balancer dns entry"
+            domain = i['domain_name'] + "."
+            rrset = rrsets[domain, 'CNAME']
+            rrset.delete
+        elsif !domain_exists && action =="down" then
+            puts "WARNING: domain does not exist"
+        end
+
+
+    # type: ec2
+    elsif i['type'] == "ec2" then
+
+        # setup
+        puts "---- running ec2 " + action + ": " + i['name']
+        puts "     checking if domain name exists"
+        domain_exists = false
+        rrsets.each { |r|
+            if r.name.include? i['domain_name'] then
+                domain_exists = true
+            end
+        }
+
+        # up action
+        if !domain_exists && action == "up" then
+            puts "     creating ec2 instance"
+            ins = ec2.instances.create(
+                :image_id => i['image_id'],
+                :instance_type => i['instance_type'],
+                :count => 1,
+                :security_groups => i['security_group'],
+                :key_pair => ec2.key_pairs[config['key_pair']],
+                :subnet => config['subnet']
+            )
+            puts "     waiting on ec2 instance status"
+            sleep 10 while ins.status != :running
+            puts "     confirmed ec2 instance status is 'running'"
+            puts "     creating ec2 instance tag name"
+            ec2.tags.create(ins, "Name", :value => i['domain_name'])
+            puts "     creating ec2 dns entry"
+            rrsets.create(i['domain_name'], 'CNAME', :ttl => 60, :resource_records => [{:value => ins.dns_name}])
+            if i['wait_status'] then
+                puts "     waiting on ec2 status checks"
+                check_pass = false
+                while !check_pass do
+                    instance_status = ec2.client.describe_instance_status(:instance_ids => [ins.id])
+                    chk1 = instance_status[:instance_status_set][0][:system_status][:status]
+                    chk2 = instance_status[:instance_status_set][0][:instance_status][:status]
+                    if chk1 == "ok" && chk2 == "ok" then
+                        check_pass = true
+                        puts "     confirmed ec2 status checks are 'ok'"
+                    else
+                        sleep 10
+                    end
+                end
+            end
+            if i['lb_name'] != "none" then
+                puts "     adding ec2 instance to load balancer"
+                elb.load_balancers[i['lb_name']].instances.register(ins)
+            end
+        elsif domain_exists && action == "up" then
+            abort("ERROR: ec2 server already exists")
+        end
+
+        # down action
+        if domain_exists && action == "down" then
+            puts "     removing ec2 instance"
+            ec2.instances.tagged_values(i['domain_name']).each { |ins|
+                ins.terminate
+            }
+            puts "     removing ec2 dns entry"
+            domain = i['domain_name'] + "."
+            rrset = rrsets[domain, 'CNAME']
+            rrset.delete
+        elsif !domain_exists && action == "down" then
+            puts "WARNING: ec2 server does not exist"
+        end
+
+
+    # type: winrm
+    elsif i['type'] == "winrm" then
+
+        # dynamic action
+        if i['execute_on'] == action then
+            puts "---- running winrm " + action + ": " + i['name']
+            puts "     looking up internal address"
+            server_resolved = i['server_name']
+            ec2.instances.tagged_values(server_resolved).each { |ins|
+                if ins.status == :running then
+                    server_resolved = ins.private_dns_name
+                end
+            }
+            repeat = i['repeat']
+            found = false
+            while repeat > 0 do
+                puts "     executing winrm command"
+                server_url = "http://" + server_resolved + ":5985/wsman"
+                winrm = WinRM::WinRMWebService.new(server_url, :plaintext, :user => i['server_user'], :pass => i['server_pass'], :disable_sspi => true)
+                winrm.cmd(i['command']) do |stdout, stderr|
+                   if i['show_output']
+                        puts ""
+                        puts stdout
+                        puts stderr
+                        puts ""
+                    end
+                    if !stdout.nil? && !stdout.empty?
+                        if stdout.include? i['look_for']
+                            repeat = 0
+                            found = true
+                        end
+                    end
+                end
+                repeat = repeat-1
+                if repeat > 0
+                    puts "     waiting to repeat winrm command"
+                    sleep 30
+                end
+            end
+            if found
+                puts "     completed winrm command"
+            else
+                abort("ERROR: failed finding match in winrm command")
+            end
+        end
+
+
+    # type: eventlog
+    elsif i['type'] == "eventlog" then
+
+        # dynamic action
+        if i['execute_on'] == action then
+            puts "---- running eventlog " + action + ": " + i['name']
+
+            # resolve server name
+            server_resolved = i['server_name']
+            ec2.instances.tagged_values(server_resolved).each { |ins|
+                if ins.status == :running then
+                    server_resolved = ins.private_dns_name
+                end
+            }
+
+
+            # get initial event log entry
+            server_url = "http://" + server_resolved + ":5985/wsman"
+            winrm = WinRM::WinRMWebService.new(server_url, :plaintext, :user => i['server_user'], :pass => i['server_pass'], :disable_sspi => true)
+            wcmd = "wevtutil qe Application /f:Text /rd:true /c:1"
+            repeat = true
+            source = ""
+            date = ""
+            last_event = "0000-00-00T00:00:00.000"
+            events = Array.new
+            while repeat do
+                events.clear
+                winrm.cmd(wcmd) do |stdout, stderr|
+                    if !stderr.nil? then
+                        puts stderr
+                    end
+                    stdout.split("\n").each { |line|
+                        if line.strip.end_with?(']:') then
+                            # nothing
+                        elsif line.start_with?('  Source: ') then
+                            source = line.sub('  Source: ','').strip
+                        elsif line.start_with?('  Date: ') then
+                            date = line.sub('  Date: ','').strip
+                        elsif line.start_with?('  Event ID:') then
+                            # nothing
+                        elsif line.start_with?('  Task:') then
+                            # nothing
+                        elsif line.start_with?('  Level:') then
+                            # nothing
+                        elsif line.start_with?('  Opcode:') then
+                            # nothing
+                        elsif line.start_with?('  Keyword:') then
+                            # nothing
+                        elsif line.start_with?('  User:') then
+                            # nothing
+                        elsif line.start_with?('  User Name:') then
+                            # nothing
+                        elsif line.start_with?('  Computer:') then
+                            # nothing
+                        elsif line.start_with?('  Log Name:') then
+                            # nothing
+                        elsif line.start_with?('  Description:') then
+                            # nothing
+                        elsif line.strip.empty? then
+                            # nothing
+                        else
+                            events.push(date + " " + source + ": " + line)
+                        end
+                    }
+                end
+                events.reverse.each { |event|
+                    if !(event[0...23] <= last_event[0...23])
+                        if repeat && (event.include?(i['filter'].strip) || i['filter'].strip == "*") then
+                            puts event
+                            last_event = event
+                            if event.include?(i['look_for']) then
+                                repeat = false
+                            end
+                        end
+                    end
+                }
+                if repeat then
+                    wcmd = "wevtutil qe Application /f:Text /rd:true /c:50"
+                    sleep 5
+                end
+            end
+        end
+
+
+    # type: sleep
+    elsif i['type'] == "sleep" then
+
+        # dynamic action
+        if i['execute_on'] == action then
+            puts "---- running sleep " + action + ": " + i['name']
+            puts "     waiting on sleep"
+            sleep i['sleep_for']
+        end
+
+
+    # type: unknown
+    else
+        puts "ERROR: type '" + i['type'] + "' not supported"
+    end
+
+
+}
+
+
+# finalize
+end_time = Time.now
+diff = (end_time - start_time).to_s
+puts ""
+puts ["="].cycle(60).to_a.join('')
+puts "COMPLETE (" + diff + "s)"
+exit

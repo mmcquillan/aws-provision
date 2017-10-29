@@ -1,0 +1,11 @@
+# main aws access keys
+# access_key_id: <access key>
+# secret_access_key: <secret key>
+#
+# # for route 53 dns entries
+# hosted_zone_id: <zone id>
+#
+# # general instance info
+# availability_zone: us-east-1a
+# key_pair: <key pair name>
+# subnet: <subnet>
