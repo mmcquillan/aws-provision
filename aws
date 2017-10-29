@@ -65,7 +65,7 @@ env['aws'].each { |i|
 
         # setup
         puts "---- running lb " + action + ": " + i['name']
-ecking if domain name exists"
+        puts "     checking if domain name exists"
         domain_exists = false
         rrsets.each { |r|
             if r.name.include? i['domain_name'] then
